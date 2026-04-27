@@ -1,4 +1,4 @@
-import base64, collections, copy, fcntl, glob, io, lzma, math, os
+import base64, collections, copy, ctypes, fcntl, glob, hashlib, io, lzma, math, os, tempfile
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import Tensor, nn
@@ -366,6 +366,15 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    ppm_enabled = bool(int(os.environ.get("PPM_ENABLED", "0")))
+    ppm_order = int(os.environ.get("PPM_ORDER", 4))
+    ppm_lambda_hi = float(os.environ.get("PPM_LAMBDA_HI", 0.9))
+    ppm_lambda_lo = float(os.environ.get("PPM_LAMBDA_LO", 0.05))
+    ppm_conf_threshold = float(os.environ.get("PPM_CONF_THRESHOLD", 0.9))
+    ppm_log_cache_size = int(os.environ.get("PPM_LOG_CACHE_SIZE", 1048576))
+    ppm_native_enabled = bool(int(os.environ.get("PPM_NATIVE_ENABLED", "1")))
+    ppm_debug_subset_tokens = int(os.environ.get("PPM_DEBUG_SUBSET_TOKENS", 0))
+    ppm_sliding_batch_seqs = int(os.environ.get("PPM_SLIDING_BATCH_SEQS", 32))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -460,6 +469,7 @@ class ValidationData:
             self.has_leading_space_lut,
             self.is_boundary_token_lut,
         ) = build_sentencepiece_luts(self.sp, h.vocab_size, device)
+        self.token_bytes_py = build_token_bytes_lut(self.sp, h.vocab_size)
         # CaseOps: when enabled, load per-token byte sidecar and stash it as a
         # CPU tensor aligned 1:1 with self.val_tokens. eval_val/eval_val_ttt
         # branches use this as the canonical raw-byte budget per token.
@@ -497,6 +507,27 @@ def build_sentencepiece_luts(sp, vocab_size, device):
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
+
+
+def build_token_bytes_lut(sp, vocab_size):
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    out = [b"" for _ in range(table_size)]
+    for token_id in range(sp_vocab_size):
+        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+            continue
+        if sp.is_byte(token_id):
+            piece = sp.id_to_piece(token_id)
+            try:
+                out[token_id] = bytes([int(piece[3:-1], 16)])
+            except Exception:
+                out[token_id] = b""
+            continue
+        piece = sp.id_to_piece(token_id)
+        if piece.startswith("▁"):
+            piece = piece[1:]
+        out[token_id] = piece.encode("utf-8")
+    return out
 
 
 def load_validation_tokens(pattern, seq_len):
@@ -2608,6 +2639,319 @@ def eval_val(h, device, val_data, model, forward_logits_fn=None):
     return _loss_bpb(val_loss_sum, val_token_count, val_byte_count)
 
 
+_NATIVE_PPM_LIB = None
+
+
+def _build_native_ppm_lib():
+    global _NATIVE_PPM_LIB
+    if _NATIVE_PPM_LIB is not None:
+        return _NATIVE_PPM_LIB
+    code = r'''
+#include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct{uint64_t key;uint32_t total,max_count,unique,head;uint8_t used,ib[4];uint32_t ic[4];} Ctx;
+typedef struct{uint32_t next,ctx,count;uint8_t byte;} Edge;
+typedef struct{Ctx*ctx;uint64_t cap,used;Edge*edges;uint64_t ecap,eused;} Table;
+static uint64_t mix64(uint64_t x){x^=x>>33;x*=0xff51afd7ed558ccdULL;x^=x>>33;x*=0xc4ceb9fe1a85ec53ULL;x^=x>>33;return x;}
+static int table_init(Table*t,uint64_t cap){uint64_t c=1;while(c<cap)c<<=1;t->cap=c;t->used=0;t->ctx=(Ctx*)calloc(c,sizeof(Ctx));t->ecap=cap*2+1024;t->eused=1;t->edges=(Edge*)calloc(t->ecap,sizeof(Edge));return t->ctx&&t->edges?0:-1;}
+static void table_free(Table*t){free(t->ctx);free(t->edges);memset(t,0,sizeof(*t));}
+static int grow_edges(Table*t){uint64_t nc=t->ecap*2;Edge*ne=(Edge*)realloc(t->edges,nc*sizeof(Edge));if(!ne)return-1;memset(ne+t->ecap,0,(nc-t->ecap)*sizeof(Edge));t->edges=ne;t->ecap=nc;return 0;}
+static Ctx* table_find(Table*t,uint64_t key){uint64_t m=t->cap-1,i=mix64(key)&m;for(;;){Ctx*c=&t->ctx[i];if(!c->used)return 0;if(c->key==key)return c;i=(i+1)&m;}}
+static int table_rehash(Table*t){Table nt;if(table_init(&nt,t->cap*2))return-1;free(nt.edges);nt.edges=t->edges;nt.ecap=t->ecap;nt.eused=t->eused;for(uint64_t j=0;j<t->cap;j++)if(t->ctx[j].used){uint64_t m=nt.cap-1,i=mix64(t->ctx[j].key)&m;while(nt.ctx[i].used)i=(i+1)&m;nt.ctx[i]=t->ctx[j];nt.used++;}free(t->ctx);*t=nt;return 0;}
+static Ctx* table_get_or_add(Table*t,uint64_t key){if((t->used+1)*10>t->cap*7)if(table_rehash(t))return 0;uint64_t m=t->cap-1,i=mix64(key)&m;for(;;){Ctx*c=&t->ctx[i];if(!c->used){c->used=1;c->key=key;c->head=0;t->used++;return c;}if(c->key==key)return c;i=(i+1)&m;}}
+static uint32_t edge_count(Table*t,Ctx*c,uint8_t b){uint32_t m=c->unique<4?c->unique:4;for(uint32_t i=0;i<m;i++)if(c->ib[i]==b)return c->ic[i];for(uint32_t e=c->head;e;e=t->edges[e].next)if(t->edges[e].byte==b)return t->edges[e].count;return 0;}
+static int edge_inc(Table*t,Ctx*c,uint8_t b){uint32_t m=c->unique<4?c->unique:4;for(uint32_t i=0;i<m;i++)if(c->ib[i]==b){uint32_t nc=++c->ic[i];c->total++;if(nc>c->max_count)c->max_count=nc;return 0;}for(uint32_t e=c->head;e;e=t->edges[e].next)if(t->edges[e].byte==b){uint32_t nc=++t->edges[e].count;c->total++;if(nc>c->max_count)c->max_count=nc;return 0;}if(c->unique<4){uint32_t i=c->unique;c->ib[i]=b;c->ic[i]=1;c->total++;c->unique++;if(c->max_count<1)c->max_count=1;return 0;}if(t->eused>=t->ecap)if(grow_edges(t))return-1;uint32_t e=(uint32_t)t->eused++;t->edges[e].byte=b;t->edges[e].count=1;t->edges[e].ctx=(uint32_t)(c-t->ctx);t->edges[e].next=c->head;c->head=e;c->total++;c->unique++;if(c->max_count<1)c->max_count=1;return 0;}
+static uint64_t mask_for(int K){return K>=8?~0ULL:((1ULL<<(8*K))-1ULL);}
+static inline double lgi(uint32_t x,double*lc,uint32_t lcap){if(lc&&x<lcap){double v=lc[x];if(v>=0.0)return v;v=log((double)x);lc[x]=v;return v;}return log((double)x);}
+static int score_byte(Table*tables,uint32_t*c0,uint32_t*tot0,uint32_t*uniq0,uint32_t*max0,uint64_t*hist,int*wlen,int order,uint8_t b,double nn_logp,double lambda_hi,double lambda_lo,double lhi,double llo,double l1hi,double l1lo,double thr,double*lc,uint32_t lcap,double*mix_nll,double*ppm_nll,double*nn_nll,uint64_t*bytes,uint64_t*gate_high,uint64_t*gate_total){const double uni=log(1.0/256.0);double ppm_log=0.0,conf=0.0,esc=0.0;int found=0,seen=0,maxk=*wlen<order?*wlen:order;uint64_t keys[9];keys[0]=0;for(int K=1;K<=maxk;K++)keys[K]=(*hist)&mask_for(K);for(int K=maxk;K>=1;K--){Ctx*c=table_find(&tables[K],keys[K]);if(!c)continue;uint32_t den=c->total+c->unique;if(!den)continue;double denom=(double)den;if(!seen){conf=(double)c->max_count/denom;seen=1;}uint32_t cnt=edge_count(&tables[K],c,b);if(cnt){ppm_log=esc+(lgi(cnt,lc,lcap)-lgi(den,lc,lcap));found=1;break;}if(c->unique>0)esc+=lgi(c->unique,lc,lcap)-lgi(den,lc,lcap);}if(!found){uint32_t den0=*tot0+*uniq0;if(den0>0){double denom0=(double)den0;if(!seen){conf=(double)(*max0)/denom0;seen=1;}uint32_t cnt=c0[b];if(cnt){ppm_log=esc+(lgi(cnt,lc,lcap)-lgi(den0,lc,lcap));found=1;}else if(*uniq0>0)esc+=lgi(*uniq0,lc,lcap)-lgi(den0,lc,lcap);}}if(!found)ppm_log=esc+uni;double lam=conf>=thr?lambda_lo:lambda_hi;(*gate_total)++;if(conf>=thr)(*gate_high)++;double log_mix;if(lam<=0.0)log_mix=ppm_log;else if(lam>=1.0)log_mix=nn_logp;else{int hi=conf>=thr;double a=(hi?llo:lhi)+nn_logp,c=(hi?l1lo:l1hi)+ppm_log,m=a>c?a:c;log_mix=m+log(exp(a-m)+exp(c-m));}*mix_nll-=log_mix;*ppm_nll-=ppm_log;*nn_nll-=nn_logp;(*bytes)++;uint32_t nc=++c0[b];(*tot0)++;if(nc==1)(*uniq0)++;if(nc>*max0)*max0=nc;for(int K=1;K<=maxk;K++){Ctx*c=table_get_or_add(&tables[K],keys[K]);if(!c||edge_inc(&tables[K],c,b))return-1;}if(order>0){*hist=((*hist)<<8|b)&mask_for(order);if(*wlen<order)(*wlen)++;}return 0;}
+int ppm_score(const int64_t*target,const int64_t*prev,const double*nll,int64_t n,const uint8_t*flat,const int32_t*offs,const int32_t*lens,const uint8_t*has_space,const uint8_t*is_boundary,int vocab,int order,double lambda_hi,double lambda_lo,double thr,uint32_t log_cache_size,double*out){if(order<0||order>8)return-2;Table tables[9];uint64_t cap=(uint64_t)n*2+1024;for(int k=1;k<=order;k++)if(table_init(&tables[k],cap/(k+1)+1024))return-3;double*lc=0;if(log_cache_size>1){lc=(double*)malloc((size_t)log_cache_size*sizeof(double));if(!lc)return-6;for(uint32_t i=0;i<log_cache_size;i++)lc[i]=-1.0;}double lhi=log(lambda_hi),llo=log(lambda_lo),l1hi=log(1.0-lambda_hi),l1lo=log(1.0-lambda_lo);uint32_t c0[256];memset(c0,0,sizeof(c0));uint32_t tot0=0,uniq0=0,max0=0;uint64_t hist=0;int wlen=0;double mix_nll=0,ppm_nll=0,nn_nll=0,token_nll=0;uint64_t bytes=0,gate_high=0,gate_total=0;for(int64_t i=0;i<n;i++){int tid=(int)target[i],pid=(int)prev[i];if(tid<0||tid>=vocab)continue;int len=lens[tid];int inc_space=has_space[tid]&&(pid<0||!is_boundary[pid]);int nb=len+(inc_space?1:0);if(nb<=0)continue;double nn_logp=-nll[i]/(double)nb;token_nll+=nll[i];if(inc_space)if(score_byte(tables,c0,&tot0,&uniq0,&max0,&hist,&wlen,order,32,nn_logp,lambda_hi,lambda_lo,lhi,llo,l1hi,l1lo,thr,lc,log_cache_size,&mix_nll,&ppm_nll,&nn_nll,&bytes,&gate_high,&gate_total))return-4;const uint8_t*p=flat+offs[tid];for(int j=0;j<len;j++)if(score_byte(tables,c0,&tot0,&uniq0,&max0,&hist,&wlen,order,p[j],nn_logp,lambda_hi,lambda_lo,lhi,llo,l1hi,l1lo,thr,lc,log_cache_size,&mix_nll,&ppm_nll,&nn_nll,&bytes,&gate_high,&gate_total))return-5;}const double log2v=log(2.0);out[0]=bytes?mix_nll/(double)bytes/log2v:0;out[1]=bytes?ppm_nll/(double)bytes/log2v:0;out[2]=bytes?nn_nll/(double)bytes/log2v:0;out[3]=bytes?token_nll/(double)bytes/log2v:0;out[4]=(double)bytes;out[5]=gate_total?(double)gate_high/(double)gate_total:0;if(lc)free(lc);for(int k=1;k<=order;k++)table_free(&tables[k]);return 0;}
+'''
+    digest = hashlib.sha1(code.encode()).hexdigest()[:12]
+    c_path = os.path.join(tempfile.gettempdir(), f"parameter_golf_ppm_{digest}.c")
+    so_path = os.path.join(tempfile.gettempdir(), f"parameter_golf_ppm_{digest}.so")
+    if not os.path.exists(so_path):
+        with open(c_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        cmd = ["gcc", "-O3", "-march=native", "-fPIC", "-shared", c_path, "-o", so_path, "-lm"]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            raise RuntimeError("native ppm build failed: " + res.stderr[-1000:])
+    lib = ctypes.CDLL(so_path)
+    lib.ppm_score.argtypes = [
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_double),
+    ]
+    lib.ppm_score.restype = ctypes.c_int
+    _NATIVE_PPM_LIB = lib
+    return lib
+
+
+def _ppm_mixture_bpb_native(
+    target_ids,
+    prev_ids,
+    nll_nats,
+    token_bytes_lut,
+    has_leading_space_lut_np,
+    is_boundary_token_lut_np,
+    order=4,
+    lambda_hi=0.9,
+    lambda_lo=0.05,
+    conf_threshold=0.9,
+    log_prefix="ppm_full_native",
+    log_cache_size=1048576,
+):
+    vocab = len(token_bytes_lut)
+    lens = np.array([len(b) for b in token_bytes_lut], dtype=np.int32)
+    offs = np.zeros(vocab, dtype=np.int32)
+    total = int(lens.sum())
+    flat = np.empty(total, dtype=np.uint8)
+    p = 0
+    for i, b in enumerate(token_bytes_lut):
+        offs[i] = p
+        lb = len(b)
+        if lb:
+            flat[p : p + lb] = np.frombuffer(b, dtype=np.uint8)
+        p += lb
+    target_ids = np.ascontiguousarray(target_ids, dtype=np.int64)
+    prev_ids = np.ascontiguousarray(prev_ids, dtype=np.int64)
+    nll_nats = np.ascontiguousarray(nll_nats, dtype=np.float64)
+    has = np.ascontiguousarray(has_leading_space_lut_np.astype(np.uint8))
+    isb = np.ascontiguousarray(is_boundary_token_lut_np.astype(np.uint8))
+    out = np.zeros(6, dtype=np.float64)
+    lib = _build_native_ppm_lib()
+    rc = lib.ppm_score(
+        target_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+        prev_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+        nll_nats.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        target_ids.size,
+        flat.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        offs.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        lens.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        has.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        isb.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        vocab,
+        order,
+        lambda_hi,
+        lambda_lo,
+        conf_threshold,
+        int(log_cache_size),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+    )
+    if rc != 0:
+        raise RuntimeError(f"native ppm failed rc={rc}")
+    log(
+        f"{log_prefix} tokens={len(target_ids)} bytes={int(out[4])} "
+        f"mix_bpb={out[0]:.8f} ppm_only={out[1]:.8f} nn_byte_bpb={out[2]:.8f} "
+        f"nn_token_bpb={out[3]:.8f} gate_high_frac={out[5]:.6f} "
+        f"order={order} lambda_hi={lambda_hi} lambda_lo={lambda_lo} "
+        f"threshold={conf_threshold} log_cache={log_cache_size}"
+    )
+    return tuple(float(x) for x in out)
+
+
+def eval_val_sliding_ppm(h, device, val_data, base_model, forward_logits_fn=None, batch_seqs=32):
+    if val_data.caseops_enabled:
+        raise RuntimeError(
+            "PPM_ENABLED with CaseOps needs an original-byte identity sidecar, not only "
+            "the existing per-token byte-count sidecar. Run CASEOPS_ENABLED=0 for the "
+            "strict SP8192 PPM path, or add a reversible original-byte sidecar first."
+        )
+    base_model.eval()
+    logits_fn = (
+        (base_model.module.forward_logits if hasattr(base_model, "module") else base_model.forward_logits)
+        if forward_logits_fn is None
+        else forward_logits_fn
+    )
+    seq_len = h.eval_seq_len
+    context_size = seq_len - h.eval_stride
+    total_tokens = val_data.val_tokens.numel() - 1
+    window_starts = [
+        ws for ws in range(0, total_tokens, h.eval_stride)
+        if ws + context_size < total_tokens
+    ]
+    total_windows = len(window_starts)
+    my_s = total_windows * h.rank // h.world_size
+    my_e = total_windows * (h.rank + 1) // h.world_size
+    my_windows = window_starts[my_s:my_e]
+    local_count = sum(
+        (min(ws + seq_len, total_tokens) - ws) - (0 if ws == 0 else context_size)
+        for ws in my_windows
+    )
+    nll_np = np.empty(local_count, dtype=np.float64)
+    tgt_np = np.empty(local_count, dtype=np.int32)
+    prev_np = np.empty(local_count, dtype=np.int32)
+    write_i = 0
+    first_pos = -1
+    last_pos = -1
+    t0_collect = time.perf_counter()
+    log(
+        f"sliding_collect:start total_windows={total_windows} my_windows={len(my_windows)} "
+        f"tokens={local_count} rank={h.rank}"
+    )
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi : bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens = []
+            for i, ws in enumerate(batch_ws):
+                we = min(ws + seq_len, total_tokens)
+                wlen = we - ws
+                wlens.append(wlen)
+                chunk = val_data.val_tokens[ws : we + 1].to(
+                    dtype=torch.int64, device=device, non_blocking=True
+                )
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = logits_fn(x_batch)
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+            batch_nll, batch_tgt, batch_prev = [], [], []
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else context_size
+                scored_nll = nll[i, s:wlen].to(torch.float64)
+                tgt = y_batch[i, s:wlen]
+                prev = x_batch[i, s:wlen]
+                start_pos = ws + s
+                end_pos = ws + wlen
+                if first_pos < 0:
+                    first_pos = start_pos
+                last_pos = end_pos - 1
+                batch_nll.append(scored_nll)
+                batch_tgt.append(tgt)
+                batch_prev.append(prev)
+            if batch_nll:
+                cn = torch.cat(batch_nll).cpu().numpy()
+                ct = torch.cat(batch_tgt).cpu().numpy().astype(np.int32, copy=False)
+                cp = torch.cat(batch_prev).cpu().numpy().astype(np.int32, copy=False)
+                n = len(cn)
+                nll_np[write_i : write_i + n] = cn
+                tgt_np[write_i : write_i + n] = ct
+                prev_np[write_i : write_i + n] = cp
+                write_i += n
+    if write_i != len(nll_np):
+        raise RuntimeError(
+            f"sliding_collect local count mismatch rank={h.rank} wrote={write_i} expected={len(nll_np)}"
+        )
+    job = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{h.run_id}_{os.environ.get('MASTER_PORT','0')}")
+    ppm_dir = os.path.join(tempfile.gettempdir(), f"pg_ppm_{job}")
+    os.makedirs(ppm_dir, exist_ok=True)
+    rank_path = os.path.join(ppm_dir, f"rank{h.rank}.bin")
+    done_path = os.path.join(ppm_dir, "done")
+    tmp_path = rank_path + f".tmp{os.getpid()}"
+    with open(tmp_path, "wb") as f:
+        np.array([first_pos, last_pos, len(nll_np)], dtype=np.int64).tofile(f)
+        nll_np.tofile(f)
+        tgt_np.tofile(f)
+        prev_np.tofile(f)
+    os.replace(tmp_path, rank_path)
+    log(
+        f"sliding_collect:rank_local_done rank={h.rank} tokens={len(nll_np)} "
+        f"first={first_pos} last={last_pos} seconds={time.perf_counter()-t0_collect:.1f}"
+    )
+    if h.rank != 0:
+        while not os.path.exists(done_path):
+            time.sleep(0.5)
+        base_model.train()
+        return 0.0, 0.0
+    paths = [os.path.join(ppm_dir, f"rank{r}.bin") for r in range(h.world_size)]
+    wait_t = time.perf_counter()
+    while not all(os.path.exists(p) for p in paths):
+        time.sleep(0.2)
+    parts = []
+    for pth in paths:
+        with open(pth, "rb") as f:
+            hdr = np.fromfile(f, dtype=np.int64, count=3)
+            n = int(hdr[2])
+            parts.append(
+                (
+                    int(hdr[0]),
+                    int(hdr[1]),
+                    np.fromfile(f, dtype=np.float64, count=n),
+                    np.fromfile(f, dtype=np.int32, count=n),
+                    np.fromfile(f, dtype=np.int32, count=n),
+                )
+            )
+    firsts = np.array([x[0] for x in parts])
+    lasts = np.array([x[1] for x in parts])
+    lens = np.array([len(x[2]) for x in parts])
+    order = np.argsort(firsts)
+    expected = 0
+    for i in order:
+        if lens[i] and (firsts[i] != expected or lasts[i] + 1 - firsts[i] != lens[i]):
+            raise RuntimeError(
+                f"sliding_collect gap rankfile={i} first={firsts[i]} last={lasts[i]} "
+                f"len={lens[i]} expected={expected}"
+            )
+        expected += lens[i]
+    if expected != total_tokens:
+        raise RuntimeError(f"sliding_collect total mismatch got={expected} expected={total_tokens}")
+    nll_np = np.concatenate([parts[i][2] for i in order])
+    tgt_np = np.concatenate([parts[i][3] for i in order])
+    prev_np = np.concatenate([parts[i][4] for i in order])
+    log(
+        f"sliding_collect:gather_done tokens={len(nll_np)} wait={time.perf_counter()-wait_t:.1f}s "
+        f"total={time.perf_counter()-t0_collect:.1f}s"
+    )
+    debug_subset = int(getattr(h, "ppm_debug_subset_tokens", 0))
+    debug_mode = debug_subset > 0
+    if debug_mode:
+        limit = min(debug_subset, len(tgt_np))
+        nll_np = nll_np[:limit]
+        tgt_np = tgt_np[:limit]
+        prev_np = prev_np[:limit]
+        log(f"ppm_debug_subset:enabled tokens={limit}; returning debug BPB")
+    has_leading_np = val_data.has_leading_space_lut.detach().cpu().numpy().astype(bool)
+    is_boundary_np = val_data.is_boundary_token_lut.detach().cpu().numpy().astype(bool)
+    t0 = time.perf_counter()
+    log(f"ppm_native:start tokens={len(tgt_np)}")
+    mix_bpb, ppm_bpb, nn_byte_bpb, nn_token_bpb, ppm_bytes, gate_frac = _ppm_mixture_bpb_native(
+        tgt_np,
+        prev_np,
+        nll_np,
+        val_data.token_bytes_py,
+        has_leading_np,
+        is_boundary_np,
+        order=h.ppm_order,
+        lambda_hi=h.ppm_lambda_hi,
+        lambda_lo=h.ppm_lambda_lo,
+        conf_threshold=h.ppm_conf_threshold,
+        log_prefix="ppm_debug_native" if debug_mode else "ppm_full_native",
+        log_cache_size=h.ppm_log_cache_size,
+    )
+    log(
+        f"ppm_time:{time.perf_counter()-t0:.1f}s native={h.ppm_native_enabled} "
+        f"full_val={not debug_mode} scored_tokens={len(tgt_np)}"
+    )
+    with open(done_path, "w", encoding="utf-8") as f:
+        f.write("1")
+    base_model.train()
+    val_loss_equiv = mix_bpb * math.log(2.0) * (float(ppm_bytes) / max(float(len(tgt_np)), 1.0))
+    return val_loss_equiv, mix_bpb
+
+
 def _find_docs(all_tokens):
     bos_positions = (all_tokens == BOS_ID).nonzero(as_tuple=True)[0].numpy()
     docs = []
@@ -3410,6 +3754,17 @@ def train_and_eval(h, device):
             compiled_model,
             compiled_forward_logits,
         )
+        if h.ppm_enabled:
+            timed_eval(
+                "quantized_sliding_ppm",
+                eval_val_sliding_ppm,
+                h,
+                device,
+                val_data,
+                eval_model,
+                compiled_forward_logits,
+                h.ppm_sliding_batch_seqs,
+            )
         del eval_model
     if h.ttt_enabled:
         if not ttt_eval_only:
