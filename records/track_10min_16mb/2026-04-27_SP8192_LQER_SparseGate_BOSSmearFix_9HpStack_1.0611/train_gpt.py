@@ -300,6 +300,13 @@ class Hyperparameters:
     ttt_o_lora = bool(int(os.environ.get("TTT_O_LORA", "1")))
     ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "adam")
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
+    ttt_class_weight_enabled = bool(int(os.environ.get("TTT_CLASS_WEIGHT_ENABLED", "0")))
+    ttt_weight_leading_space = float(os.environ.get("TTT_WEIGHT_LEADING_SPACE", 1.0))
+    ttt_weight_digit = float(os.environ.get("TTT_WEIGHT_DIGIT", 1.0))
+    ttt_weight_punct = float(os.environ.get("TTT_WEIGHT_PUNCT", 1.0))
+    ttt_weight_alpha = float(os.environ.get("TTT_WEIGHT_ALPHA", 1.0))
+    ttt_weight_caseops = float(os.environ.get("TTT_WEIGHT_CASEOPS", 1.0))
+    ttt_weight_other = float(os.environ.get("TTT_WEIGHT_OTHER", 1.0))
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
@@ -471,6 +478,11 @@ class ValidationData:
             self.val_bytes = load_validation_byte_sidecar(
                 h.val_bytes_files, h.eval_seq_len, self.val_tokens.numel()
             )
+        self.ttt_class_weight_lut = None
+        if bool(getattr(h, "ttt_class_weight_enabled", False)):
+            self.ttt_class_weight_lut = build_ttt_class_weight_lut(
+                self.sp, h.vocab_size, h, device
+            )
 
 
 def build_sentencepiece_luts(sp, vocab_size, device):
@@ -499,6 +511,41 @@ def build_sentencepiece_luts(sp, vocab_size, device):
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
+
+
+def build_ttt_class_weight_lut(sp, vocab_size, h, device):
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    weights_np = np.full((table_size,), float(h.ttt_weight_other), dtype=np.float32)
+    caseops_prefixes = ("\uE000", "\uE001", "\uE002", "\uE003", "\uE004")
+    for token_id in range(sp_vocab_size):
+        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+            continue
+        if sp.is_byte(token_id):
+            weights_np[token_id] = float(h.ttt_weight_other)
+            continue
+        piece = sp.id_to_piece(token_id)
+        if piece.startswith(caseops_prefixes):
+            weights_np[token_id] = float(h.ttt_weight_caseops)
+            continue
+        if piece.startswith("▁"):
+            weights_np[token_id] = float(h.ttt_weight_leading_space)
+            piece = piece[1:]
+        if not piece:
+            continue
+        chars = piece
+        while chars.startswith(caseops_prefixes):
+            chars = chars[1:]
+        if not chars:
+            weights_np[token_id] = float(h.ttt_weight_caseops)
+        elif any(ch.isdigit() for ch in chars):
+            weights_np[token_id] = float(h.ttt_weight_digit)
+        elif any(ch.isalpha() for ch in chars):
+            weights_np[token_id] = float(h.ttt_weight_alpha)
+        elif any(not ch.isspace() for ch in chars):
+            weights_np[token_id] = float(h.ttt_weight_punct)
+    weights_np = np.clip(weights_np, 0.05, 8.0)
+    return torch.tensor(weights_np, dtype=torch.float32, device=device)
 
 
 def load_validation_tokens(pattern, seq_len):
@@ -3200,9 +3247,15 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                             per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
-                    per_doc = per_tok_loss[
-                        :, chunk_offset : chunk_offset + chunk_size
-                    ].mean(dim=-1)
+                    loss_slice = per_tok_loss[:, chunk_offset : chunk_offset + chunk_size]
+                    if val_data.ttt_class_weight_lut is not None:
+                        y_slice = y[:, chunk_offset : chunk_offset + chunk_size]
+                        class_weights = val_data.ttt_class_weight_lut[y_slice].to(
+                            dtype=loss_slice.dtype
+                        )
+                        per_doc = (loss_slice * class_weights).mean(dim=-1)
+                    else:
+                        per_doc = loss_slice.mean(dim=-1)
                     cur_opt.zero_grad(set_to_none=True)
                     (per_doc * activate_chunk_mask).sum().backward()
                     cur_opt.step()
