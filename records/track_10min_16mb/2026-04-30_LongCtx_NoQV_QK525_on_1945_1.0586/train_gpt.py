@@ -323,10 +323,16 @@ class Hyperparameters:
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     ttt_scale_adapter_enabled = bool(int(os.environ.get("TTT_SCALE_ADAPTER_ENABLED", "0")))
     ttt_scale_adapter_limit = float(os.environ.get("TTT_SCALE_ADAPTER_LIMIT", 0.05))
+    ttt_scale_adapter_lr_mult = float(os.environ.get("TTT_SCALE_ADAPTER_LR_MULT", 1.0))
+    ttt_scale_adapter_weight_decay = float(os.environ.get("TTT_SCALE_ADAPTER_WEIGHT_DECAY", 0.0))
     ttt_doc_bias_enabled = bool(int(os.environ.get("TTT_DOC_BIAS_ENABLED", "0")))
     ttt_doc_bias_clip = float(os.environ.get("TTT_DOC_BIAS_CLIP", 0.35))
     ttt_doc_bias_lr_mult = float(os.environ.get("TTT_DOC_BIAS_LR_MULT", 16.0))
     ttt_doc_bias_weight_decay = float(os.environ.get("TTT_DOC_BIAS_WEIGHT_DECAY", 0.02))
+    ttt_surprise_gate_enabled = bool(int(os.environ.get("TTT_SURPRISE_GATE_ENABLED", "0")))
+    ttt_surprise_gate_floor = float(os.environ.get("TTT_SURPRISE_GATE_FLOOR", 0.35))
+    ttt_surprise_gate_temp = float(os.environ.get("TTT_SURPRISE_GATE_TEMP", 0.08))
+    ttt_surprise_gate_ema = float(os.environ.get("TTT_SURPRISE_GATE_EMA", 0.80))
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
@@ -1824,6 +1830,14 @@ class BatchedTTTLoRA(nn.Module):
 
     def doc_bias_parameters(self):
         return [] if self.doc_bias is None else [self.doc_bias]
+
+    def scale_adapter_parameters(self):
+        params = []
+        if self.attn_scale_delta is not None:
+            params.append(self.attn_scale_delta)
+        if self.mlp_scale_delta is not None:
+            params.append(self.mlp_scale_delta)
+        return params
 
     def reset(self):
         with torch.no_grad():
@@ -3434,30 +3448,29 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
 
     def _build_opt(lora):
         local_lr = h.ttt_lora_lr * h.ttt_local_lr_mult
+        scale_params = list(lora.scale_adapter_parameters())
         doc_bias_params = list(lora.doc_bias_parameters())
+        special_ids = {id(p) for p in scale_params + doc_bias_params}
+        base_params = [p for p in lora.parameters() if id(p) not in special_ids]
+        param_groups = []
+        if base_params:
+            param_groups.append({
+                "params": base_params,
+                "lr": local_lr,
+                "weight_decay": h.ttt_weight_decay,
+            })
+        if scale_params:
+            param_groups.append({
+                "params": scale_params,
+                "lr": local_lr * h.ttt_scale_adapter_lr_mult,
+                "weight_decay": h.ttt_scale_adapter_weight_decay,
+            })
         if doc_bias_params:
-            doc_ids = {id(p) for p in doc_bias_params}
-            base_params = [p for p in lora.parameters() if id(p) not in doc_ids]
-            param_groups = [
-                {
-                    "params": base_params,
-                    "lr": local_lr,
-                    "weight_decay": h.ttt_weight_decay,
-                },
-                {
-                    "params": doc_bias_params,
-                    "lr": local_lr * h.ttt_doc_bias_lr_mult,
-                    "weight_decay": h.ttt_doc_bias_weight_decay,
-                },
-            ]
-        else:
-            param_groups = [
-                {
-                    "params": lora.parameters(),
-                    "lr": local_lr,
-                    "weight_decay": h.ttt_weight_decay,
-                }
-            ]
+            param_groups.append({
+                "params": doc_bias_params,
+                "lr": local_lr * h.ttt_doc_bias_lr_mult,
+                "weight_decay": h.ttt_doc_bias_weight_decay,
+            })
         if h.ttt_optimizer == "sgd":
             return torch.optim.SGD(
                 param_groups,
@@ -3508,6 +3521,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
         num_chunks = [(pl + chunk_size - 1) // chunk_size for pl in pred_lens]
         max_nc = max(num_chunks)
         num_chunks_t = torch.tensor(num_chunks, dtype=torch.int64, device=device)
+        surprise_ema = torch.zeros(bsz, device=device, dtype=torch.float32)
+        surprise_seen = torch.zeros(bsz, device=device, dtype=torch.bool)
         for ci in range(max_nc):
             active = [ci < nc for nc in num_chunks]
             needs_train = any(ci < nc - 1 for nc in num_chunks)
@@ -3581,7 +3596,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                     y_bytes=y_bytes_arg,
                 )
             if needs_train:
-                activate_chunk_mask = (num_chunks_t - 1 > ci).float()
+                activate_bool = num_chunks_t - 1 > ci
+                activate_chunk_mask = activate_bool.float()
                 for gi in range(h.ttt_grad_steps):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -3589,8 +3605,36 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                     per_doc = per_tok_loss[
                         :, chunk_offset : chunk_offset + chunk_size
                     ].mean(dim=-1)
+                    train_weight = activate_chunk_mask
+                    if h.ttt_surprise_gate_enabled:
+                        with torch.no_grad():
+                            cur_loss = per_doc.detach().float()
+                            active_losses = cur_loss[activate_bool]
+                            batch_center = (
+                                active_losses.mean()
+                                if active_losses.numel() > 0
+                                else cur_loss.mean()
+                            )
+                            baseline = torch.where(
+                                surprise_seen, surprise_ema, batch_center
+                            )
+                            temp = max(float(h.ttt_surprise_gate_temp), 1e-6)
+                            gate = torch.sigmoid((cur_loss - baseline) / temp)
+                            floor = float(h.ttt_surprise_gate_floor)
+                            gate = floor + (1.0 - floor) * gate
+                            train_weight = train_weight * gate.to(train_weight.dtype)
+                            next_ema = torch.where(
+                                surprise_seen,
+                                h.ttt_surprise_gate_ema * surprise_ema
+                                + (1.0 - h.ttt_surprise_gate_ema) * cur_loss,
+                                cur_loss,
+                            )
+                            surprise_ema = torch.where(
+                                activate_bool, next_ema, surprise_ema
+                            )
+                            surprise_seen = surprise_seen | activate_bool
                     cur_opt.zero_grad(set_to_none=True)
-                    (per_doc * activate_chunk_mask).sum().backward()
+                    (per_doc * train_weight).sum().backward()
                     cur_opt.step()
             else:
                 del per_tok_loss
