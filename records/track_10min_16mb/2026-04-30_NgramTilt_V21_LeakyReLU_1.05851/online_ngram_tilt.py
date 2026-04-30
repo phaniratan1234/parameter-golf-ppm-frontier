@@ -257,6 +257,7 @@ def build_hints_for_targets(
             "hint_ids":   np.zeros(0, dtype=np.int64),
             "gate_mask":  np.zeros(0, dtype=bool),
             "boost":      np.zeros(0, dtype=np.float32),
+            "confidence": np.zeros(0, dtype=np.float32),
             "sp":         sp,
             "starts_new_word_lut": starts_new_word_lut,
             "boundary_lut": boundary_lut,
@@ -306,6 +307,7 @@ def build_hints_for_targets(
     any_gate = best_gain > -np.inf
 
     hint_ids = np.zeros(total, dtype=np.int64)
+    confidence = np.zeros(total, dtype=np.float32)
     boost = np.zeros(total, dtype=np.float32)
     base_boost_per_expert = np.array([token_boost, within_boost, word_boost], dtype=np.float32)
     hint_per_expert = np.stack([
@@ -313,9 +315,15 @@ def build_hints_for_targets(
         within_top_tok.astype(np.int64),
         word_top_tok.astype(np.int64),
     ], axis=1)
+    conf_per_expert = np.stack([
+        token_top_prob.astype(np.float32),
+        within_top_prob.astype(np.float32),
+        word_top_prob.astype(np.float32),
+    ], axis=1)
 
     rows = np.arange(total)
     hint_ids[any_gate] = hint_per_expert[rows[any_gate], best_idx[any_gate]]
+    confidence[any_gate] = conf_per_expert[rows[any_gate], best_idx[any_gate]]
     boost[any_gate] = base_boost_per_expert[best_idx[any_gate]]
 
     # Agreement bonus: if 2+ experts agree on the same hint as best, add agree_add_boost
@@ -325,6 +333,11 @@ def build_hints_for_targets(
     agreements = (expert_hints == hint_ids[:, None]).sum(axis=1)
     agreement_extra = np.where(agreements >= 2, np.float32(agree_add_boost), np.float32(0.0))
     boost = (boost + agreement_extra).astype(np.float32)
+    confidence = np.where(
+        agreements >= 2,
+        np.minimum(np.float32(0.995), confidence + np.float32(0.05)),
+        confidence,
+    ).astype(np.float32)
 
     log0(
         f"ngram_tilt:hints total={total} gated={int(any_gate.sum())} "
@@ -336,6 +349,7 @@ def build_hints_for_targets(
         "hint_ids":   hint_ids,
         "gate_mask":  any_gate,
         "boost":      boost,
+        "confidence": confidence,
         "sp":         sp,
         "starts_new_word_lut": starts_new_word_lut,
         "boundary_lut": boundary_lut,
@@ -383,4 +397,39 @@ def apply_tilt_to_ptl_torch_fast(
     log_Z = torch.log1p(q * (torch.expm1(boost32)))
     ptl_f32 = ptl.to(torch.float32)
     ptl_tilted = ptl_f32 - boost32 * is_hit + log_Z
+    return torch.where(gate_mask, ptl_tilted, ptl_f32).to(ptl.dtype)
+
+
+def apply_odds_tilt_to_ptl_torch_fast(
+    ptl: torch.Tensor,
+    log_q_hint: torch.Tensor,
+    target_ids: torch.Tensor,
+    hint_ids: torch.Tensor,
+    gate_mask: torch.Tensor,
+    confidence: torch.Tensor,
+    *,
+    shrink: float = 0.75,
+    max_boost: float = 3.0,
+    min_conf: float = 1e-4,
+):
+    """Prefix-expert odds-ratio tilt.
+
+    Fixed-beta tilt spends the same probability mass whether the neural model
+    already agrees with the prefix expert or not. This computes the one-token
+    boost from the disagreement between the causal expert posterior r and the
+    neural posterior q for the hinted token:
+
+        beta = shrink * (logit(r) - logit(q)), clipped to [0, max_boost]
+
+    The resulting distribution is still p'(a)=exp(beta 1[a=h]) p(a)/Z over the
+    full vocab. q and r are both prefix-only before scoring y_t.
+    """
+    q = log_q_hint.to(torch.float32).clamp_(max=0.0).exp().clamp_(1e-6, 1.0 - 1e-6)
+    r = confidence.to(torch.float32).clamp_(min_conf, 1.0 - 1e-4)
+    beta = float(shrink) * (torch.logit(r) - torch.logit(q))
+    beta = beta.clamp_(0.0, float(max_boost))
+    is_hit = (target_ids == hint_ids).to(torch.float32)
+    log_Z = torch.log1p(q * torch.expm1(beta))
+    ptl_f32 = ptl.to(torch.float32)
+    ptl_tilted = ptl_f32 - beta * is_hit + log_Z
     return torch.where(gate_mask, ptl_tilted, ptl_f32).to(ptl.dtype)

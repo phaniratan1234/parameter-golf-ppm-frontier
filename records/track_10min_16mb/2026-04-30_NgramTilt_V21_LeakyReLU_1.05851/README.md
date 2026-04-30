@@ -19,6 +19,18 @@
 3. **PR #1948** (@TimS-ml, @lijuncheng16): LeakyReLU squared slope 0.3 patch (4-point sweep min identified by PR #1948).
 4. **PR #1145** (@AnirudhRahul, valerio-endorsed): closed-form n-gram tilt with three causal experts (token order 16, within-doc, word order 4) and Σ P=1 closed-form Z renormalization.
 
+## Experimental odds-ratio tilt
+
+This branch adds `NGRAM_ODDS_TILT_ENABLED=1`, a new causal overlay on top of the PR #1145 tilt. Instead of using a fixed boost for every hinted token, it computes the boost from disagreement between the causal expert confidence `r` and the neural model probability `q` for that same hint:
+
+`beta = clamp(NGRAM_ODDS_SHRINK * (logit(r) - logit(q)), 0, NGRAM_ODDS_MAX_BOOST)`
+
+The scored distribution remains normalized over the full SP8192 vocabulary:
+
+`p'(a) = exp(beta * 1[a=h]) * p(a) / (1 + p(h) * (exp(beta) - 1))`
+
+This is legal for the same reason as PR #1145: `h` and `r` come from strict-prefix state, `q` comes from the neural forward pass before the target is scored, and the target is used only after the probability is fixed.
+
 The static n-gram hint table is built in a single L→R causal pass over val tokens during `validate()` setup (env flag `NGRAM_HINT_PRECOMPUTE_OUTSIDE=1`, default). Setting the flag to 0 reproduces the inline build path with identical val_bpb.
 
 ## Compliance
@@ -55,6 +67,12 @@ python prepare_caseops_data.py  # one-time, ~10-20 min CPU
 SEED=42   bash run.sh
 SEED=0    bash run.sh
 SEED=1234 bash run.sh
+```
+
+Experimental odds-ratio run:
+
+```
+SEED=42 NGRAM_ODDS_TILT_ENABLED=1 NGRAM_ODDS_SHRINK=0.75 NGRAM_ODDS_MAX_BOOST=3.0 bash run.sh
 ```
 
 ## Credits

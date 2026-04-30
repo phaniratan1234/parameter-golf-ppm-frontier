@@ -390,6 +390,13 @@ class Hyperparameters:
     word_tau = float(os.environ.get("WORD_TAU", "0.650"))
     word_boost = float(os.environ.get("WORD_BOOST", "0.750"))
     agree_add_boost = float(os.environ.get("AGREE_ADD_BOOST", "0.500"))
+    # Odds-ratio tilt: use the causal expert confidence r and model probability
+    # q for the hinted token to choose beta = shrink * (logit(r) - logit(q)).
+    # This preserves full-vocab normalization while avoiding fixed over-boosting
+    # when the neural model already agrees with the prefix expert.
+    ngram_odds_tilt_enabled = bool(int(os.environ.get("NGRAM_ODDS_TILT_ENABLED", "0")))
+    ngram_odds_shrink = float(os.environ.get("NGRAM_ODDS_SHRINK", "0.75"))
+    ngram_odds_max_boost = float(os.environ.get("NGRAM_ODDS_MAX_BOOST", "3.0"))
     # === v5 Stage 1 optimizations (env-gated) ===
     # 1A: Move ngram hint precompute OUTSIDE eval timer (single causal pass over val tokens).
     #     Compliance: still inside validate(), single-pass causal, val tokens only.
@@ -3402,7 +3409,7 @@ def train_val_ttt_global_sgd_distributed(h, device, val_data, base_model, val_to
 
 def _compute_ngram_hints_for_val(h, val_data, log0=print):
     """Stage 1A: precompute ngram hints over full val token sequence.
-    Returns (hint_global, gate_global, boost_global) tensors on CPU, or None if tilt disabled.
+    Returns (hint_global, gate_global, boost_global, conf_global) tensors on CPU, or None if tilt disabled.
 
     Compliance: single L->R pass over val tokens; uses val data only; produces hint
     aligned to target positions [t] for predicting all_tokens[t+1] from prefix [:t+1].
@@ -3433,11 +3440,12 @@ def _compute_ngram_hints_for_val(h, val_data, log0=print):
     hint_global = torch.from_numpy(hints_pkg["hint_ids"].astype("int64"))
     gate_global = torch.from_numpy(hints_pkg["gate_mask"])
     boost_global = torch.from_numpy(hints_pkg["boost"].astype("float32"))
+    conf_global = torch.from_numpy(hints_pkg["confidence"].astype("float32"))
     log0(
         f"ngram_tilt:precompute_outside_timer_done elapsed={time.perf_counter()-t_h0:.2f}s "
         f"total_targets={hint_global.numel()}"
     )
-    return (hint_global, gate_global, boost_global)
+    return (hint_global, gate_global, boost_global, conf_global)
 
 
 def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, precomputed_hints=None):
@@ -3456,10 +3464,11 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
     ngram_hint_global = None
     ngram_gate_global = None
     ngram_boost_global = None
+    ngram_conf_global = None
     if precomputed_hints is not None:
         # v5 Stage 1A: hints were precomputed BEFORE eval timer started.
         # Save measured eval time = the precompute elapsed (~168s for full tilt).
-        ngram_hint_global, ngram_gate_global, ngram_boost_global = precomputed_hints
+        ngram_hint_global, ngram_gate_global, ngram_boost_global, ngram_conf_global = precomputed_hints
         log(
             f"ngram_tilt:using_precomputed_hints "
             f"total_targets={ngram_hint_global.numel()} (precompute time excluded from eval)"
@@ -3487,6 +3496,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
         ngram_hint_global = torch.from_numpy(hints_pkg["hint_ids"].astype("int64"))
         ngram_gate_global = torch.from_numpy(hints_pkg["gate_mask"])
         ngram_boost_global = torch.from_numpy(hints_pkg["boost"].astype("float32"))
+        ngram_conf_global = torch.from_numpy(hints_pkg["confidence"].astype("float32"))
         log(
             f"ngram_tilt:precompute_done elapsed={time.perf_counter()-t_h0:.2f}s "
             f"total_targets={ngram_hint_global.numel()}"
@@ -3625,6 +3635,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
             hint_ids_gpu = None
             gate_mask_gpu = None
             boost_gpu = None
+            conf_gpu = None
             if ngram_hint_global is not None:
                 hint_idx_cpu = (
                     tok_starts.unsqueeze(1) + col_idx[:context_size].unsqueeze(0)
@@ -3636,6 +3647,9 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
                     device=device, non_blocking=True
                 )
                 boost_gpu = ngram_boost_global[hint_idx_cpu].to(
+                    device=device, dtype=torch.float32, non_blocking=True
+                )
+                conf_gpu = ngram_conf_global[hint_idx_cpu].to(
                     device=device, dtype=torch.float32, non_blocking=True
                 )
                 hint_ids_gpu = torch.where(valid, hint_ids_gpu, torch.zeros_like(hint_ids_gpu))
@@ -3671,15 +3685,28 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, prec
             # but keep original per_tok_loss for TTT-LoRA backward (training
             # objective is base NLL — tilt is a scoring-time overlay).
             if hint_ids_gpu is not None and log_q_hint is not None:
-                from online_ngram_tilt import apply_tilt_to_ptl_torch_fast as apply_tilt_to_ptl_torch
-                tilted_loss = apply_tilt_to_ptl_torch(
-                    ptl=per_tok_loss,
-                    log_q_hint=log_q_hint,
-                    target_ids=y,
-                    hint_ids=hint_ids_gpu,
-                    gate_mask=gate_mask_gpu,
-                    boost=boost_gpu,
-                )
+                if getattr(h, "ngram_odds_tilt_enabled", False):
+                    from online_ngram_tilt import apply_odds_tilt_to_ptl_torch_fast
+                    tilted_loss = apply_odds_tilt_to_ptl_torch_fast(
+                        ptl=per_tok_loss,
+                        log_q_hint=log_q_hint,
+                        target_ids=y,
+                        hint_ids=hint_ids_gpu,
+                        gate_mask=gate_mask_gpu,
+                        confidence=conf_gpu,
+                        shrink=h.ngram_odds_shrink,
+                        max_boost=h.ngram_odds_max_boost,
+                    )
+                else:
+                    from online_ngram_tilt import apply_tilt_to_ptl_torch_fast as apply_tilt_to_ptl_torch
+                    tilted_loss = apply_tilt_to_ptl_torch(
+                        ptl=per_tok_loss,
+                        log_q_hint=log_q_hint,
+                        target_ids=y,
+                        hint_ids=hint_ids_gpu,
+                        gate_mask=gate_mask_gpu,
+                        boost=boost_gpu,
+                    )
             else:
                 tilted_loss = per_tok_loss
             with torch.no_grad():
