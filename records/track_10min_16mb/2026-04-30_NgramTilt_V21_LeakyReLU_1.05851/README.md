@@ -75,6 +75,12 @@ Experimental odds-ratio run:
 SEED=42 NGRAM_ODDS_TILT_ENABLED=1 NGRAM_ODDS_SHRINK=0.75 NGRAM_ODDS_MAX_BOOST=3.0 bash run.sh
 ```
 
+Stacked odds-ratio + TTT scale-adapter run:
+
+```
+SEED=42 NGRAM_ODDS_TILT_ENABLED=1 TTT_SCALE_ADAPTER_ENABLED=1 TTT_SCALE_ADAPTER_LIMIT=0.02 bash run.sh
+```
+
 ## Credits
 
 - **PR #1145** (@AnirudhRahul): closed-form n-gram tilt with Σ P=1 Z_t renormalization, three causal experts.
