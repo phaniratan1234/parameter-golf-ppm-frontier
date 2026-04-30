@@ -333,6 +333,12 @@ class Hyperparameters:
     ttt_surprise_gate_floor = float(os.environ.get("TTT_SURPRISE_GATE_FLOOR", 0.35))
     ttt_surprise_gate_temp = float(os.environ.get("TTT_SURPRISE_GATE_TEMP", 0.08))
     ttt_surprise_gate_ema = float(os.environ.get("TTT_SURPRISE_GATE_EMA", 0.80))
+    ttt_robust_loss_enabled = bool(int(os.environ.get("TTT_ROBUST_LOSS_ENABLED", "0")))
+    ttt_robust_loss_clip = float(os.environ.get("TTT_ROBUST_LOSS_CLIP", 1.25))
+    ttt_logit_scale_enabled = bool(int(os.environ.get("TTT_LOGIT_SCALE_ENABLED", "0")))
+    ttt_logit_scale_limit = float(os.environ.get("TTT_LOGIT_SCALE_LIMIT", 0.08))
+    ttt_logit_scale_lr_mult = float(os.environ.get("TTT_LOGIT_SCALE_LR_MULT", 8.0))
+    ttt_logit_scale_weight_decay = float(os.environ.get("TTT_LOGIT_SCALE_WEIGHT_DECAY", 0.0))
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
@@ -1563,6 +1569,8 @@ class GPT(nn.Module):
             logits = self._apply_asym_softcap(logits)
         else:
             logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        if lora.logit_scale_delta is not None:
+            logits = logits * lora.logit_gain(logits.dtype)
         if lora.doc_bias is not None:
             logits = logits + lora.doc_bias_logits(logits.dtype)
         bsz, sl, V = logits.shape
@@ -1748,11 +1756,13 @@ class BatchedTTTLoRA(nn.Module):
         q_lora=True, k_lora=True, v_lora=True, mlp_lora=True, o_lora=True,
         scale_adapter=False, scale_limit=0.05,
         doc_bias=False, doc_bias_clip=0.35,
+        logit_scale=False, logit_scale_limit=0.08,
     ):
         super().__init__()
         self.bsz = bsz
         self.scale_limit = float(scale_limit)
         self.doc_bias_clip = float(doc_bias_clip)
+        self.logit_scale_limit = float(logit_scale_limit)
         dim = model.qo_bank.shape[-1]
         vocab = model.tok_emb.num_embeddings
         if getattr(model, "looping_active", False):
@@ -1814,6 +1824,11 @@ class BatchedTTTLoRA(nn.Module):
             if doc_bias
             else None
         )
+        self.logit_scale_delta = (
+            nn.Parameter(torch.zeros(bsz, 1))
+            if logit_scale
+            else None
+        )
 
     def attn_gain(self, slot, dtype):
         return 1.0 + self.scale_limit * torch.tanh(
@@ -1828,8 +1843,17 @@ class BatchedTTTLoRA(nn.Module):
     def doc_bias_logits(self, dtype):
         return self.doc_bias_clip * torch.tanh(self.doc_bias).to(dtype)[:, None, :]
 
+    def logit_gain(self, dtype):
+        return (
+            1.0
+            + self.logit_scale_limit * torch.tanh(self.logit_scale_delta).to(dtype)
+        )[:, None, :]
+
     def doc_bias_parameters(self):
         return [] if self.doc_bias is None else [self.doc_bias]
+
+    def logit_scale_parameters(self):
+        return [] if self.logit_scale_delta is None else [self.logit_scale_delta]
 
     def scale_adapter_parameters(self):
         params = []
@@ -1853,6 +1877,8 @@ class BatchedTTTLoRA(nn.Module):
                 self.mlp_scale_delta.zero_()
             if self.doc_bias is not None:
                 self.doc_bias.zero_()
+            if self.logit_scale_delta is not None:
+                self.logit_scale_delta.zero_()
 
 
 # Polar Express per-iteration minimax Newton-Schulz coefficients (PR #1344).
@@ -3444,13 +3470,16 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
         scale_limit=h.ttt_scale_adapter_limit,
         doc_bias=h.ttt_doc_bias_enabled,
         doc_bias_clip=h.ttt_doc_bias_clip,
+        logit_scale=h.ttt_logit_scale_enabled,
+        logit_scale_limit=h.ttt_logit_scale_limit,
     ).to(device)
 
     def _build_opt(lora):
         local_lr = h.ttt_lora_lr * h.ttt_local_lr_mult
         scale_params = list(lora.scale_adapter_parameters())
         doc_bias_params = list(lora.doc_bias_parameters())
-        special_ids = {id(p) for p in scale_params + doc_bias_params}
+        logit_scale_params = list(lora.logit_scale_parameters())
+        special_ids = {id(p) for p in scale_params + doc_bias_params + logit_scale_params}
         base_params = [p for p in lora.parameters() if id(p) not in special_ids]
         param_groups = []
         if base_params:
@@ -3470,6 +3499,12 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 "params": doc_bias_params,
                 "lr": local_lr * h.ttt_doc_bias_lr_mult,
                 "weight_decay": h.ttt_doc_bias_weight_decay,
+            })
+        if logit_scale_params:
+            param_groups.append({
+                "params": logit_scale_params,
+                "lr": local_lr * h.ttt_logit_scale_lr_mult,
+                "weight_decay": h.ttt_logit_scale_weight_decay,
             })
         if h.ttt_optimizer == "sgd":
             return torch.optim.SGD(
@@ -3515,6 +3550,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 scale_limit=h.ttt_scale_adapter_limit,
                 doc_bias=h.ttt_doc_bias_enabled,
                 doc_bias_clip=h.ttt_doc_bias_clip,
+                logit_scale=h.ttt_logit_scale_enabled,
+                logit_scale_limit=h.ttt_logit_scale_limit,
             ).to(device)
             cur_opt = _build_opt(cur_lora)
         pred_lens = [doc_len - 1 for _, doc_len in batch]
@@ -3602,9 +3639,18 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                             per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
-                    per_doc = per_tok_loss[
+                    train_tok_loss = per_tok_loss[
                         :, chunk_offset : chunk_offset + chunk_size
-                    ].mean(dim=-1)
+                    ]
+                    if h.ttt_robust_loss_enabled:
+                        with torch.no_grad():
+                            center = train_tok_loss.detach().median(
+                                dim=-1, keepdim=True
+                            ).values
+                            ceiling = center + float(h.ttt_robust_loss_clip)
+                        per_doc = torch.minimum(train_tok_loss, ceiling).mean(dim=-1)
+                    else:
+                        per_doc = train_tok_loss.mean(dim=-1)
                     train_weight = activate_chunk_mask
                     if h.ttt_surprise_gate_enabled:
                         with torch.no_grad():
@@ -3722,6 +3768,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                     scale_limit=h.ttt_scale_adapter_limit,
                     doc_bias=h.ttt_doc_bias_enabled,
                     doc_bias_clip=h.ttt_doc_bias_clip,
+                    logit_scale=h.ttt_logit_scale_enabled,
+                    logit_scale_limit=h.ttt_logit_scale_limit,
                 ).to(device)
                 reusable_opt = _build_opt(reusable_lora)
                 current_phase += 1
@@ -4111,6 +4159,8 @@ def train_and_eval(h, device):
                 scale_limit=h.ttt_scale_adapter_limit,
                 doc_bias=h.ttt_doc_bias_enabled,
                 doc_bias_clip=h.ttt_doc_bias_clip,
+                logit_scale=h.ttt_logit_scale_enabled,
+                logit_scale_limit=h.ttt_logit_scale_limit,
             ).to(device)
             wo = torch.optim.AdamW(
                 wl.parameters(),
