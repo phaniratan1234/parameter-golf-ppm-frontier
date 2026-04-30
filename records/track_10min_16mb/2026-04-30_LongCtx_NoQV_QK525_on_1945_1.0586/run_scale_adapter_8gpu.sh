@@ -13,9 +13,13 @@ TOKENIZER_PATH="${TOKENIZER_PATH:-$DEFAULT_TOKENIZER_PATH}"
 SEED="${SEED:-42}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 TTT_SCALE_ADAPTER_LIMIT="${TTT_SCALE_ADAPTER_LIMIT:-0.02}"
+TTT_DOC_BIAS_ENABLED="${TTT_DOC_BIAS_ENABLED:-0}"
+TTT_DOC_BIAS_CLIP="${TTT_DOC_BIAS_CLIP:-0.35}"
+TTT_DOC_BIAS_LR_MULT="${TTT_DOC_BIAS_LR_MULT:-16.0}"
+TTT_EVAL_ONLY="${TTT_EVAL_ONLY:-0}"
 PHASED_TTT_PREFIX_DOCS="${PHASED_TTT_PREFIX_DOCS:-${PREFIX_DOCS:-2500}}"
 PHASED_TTT_NUM_PHASES="${PHASED_TTT_NUM_PHASES:-3}"
-LOG_FILE="${LOG_FILE:-run_1953_scale_adapter_seed${SEED}_limit${TTT_SCALE_ADAPTER_LIMIT}_prefix${PHASED_TTT_PREFIX_DOCS}.log}"
+LOG_FILE="${LOG_FILE:-run_1953_scale_adapter_seed${SEED}_limit${TTT_SCALE_ADAPTER_LIMIT}_bias${TTT_DOC_BIAS_ENABLED}_prefix${PHASED_TTT_PREFIX_DOCS}.log}"
 
 if [[ ! -d "$DATA_PATH" ]]; then
   echo "Missing DATA_PATH: $DATA_PATH" >&2
@@ -30,12 +34,20 @@ if [[ ! -f "$TOKENIZER_PATH" ]]; then
 fi
 
 cd "$SCRIPT_DIR"
-rm -f final_model.pt final_model.int6.ptz
+if [[ "$TTT_EVAL_ONLY" != "1" ]]; then
+  rm -f final_model.pt final_model.int6.ptz
+elif [[ ! -f final_model.int6.ptz ]]; then
+  echo "TTT_EVAL_ONLY=1 but final_model.int6.ptz is missing in $SCRIPT_DIR" >&2
+  echo "Run once without TTT_EVAL_ONLY first, or copy an existing quantized artifact here." >&2
+  exit 1
+fi
 
 echo "Running #1953 frontier + TTT activation scale adapter"
 echo "  seed: $SEED"
 echo "  gpus: $NPROC_PER_NODE"
 echo "  scale limit: $TTT_SCALE_ADAPTER_LIMIT"
+echo "  doc bias: $TTT_DOC_BIAS_ENABLED clip=$TTT_DOC_BIAS_CLIP lr_mult=$TTT_DOC_BIAS_LR_MULT"
+echo "  eval only: $TTT_EVAL_ONLY"
 echo "  prefix docs: $PHASED_TTT_PREFIX_DOCS"
 echo "  phases: $PHASED_TTT_NUM_PHASES"
 echo "  data: $DATA_PATH"
@@ -55,6 +67,8 @@ EVAL_SEQ_LEN=2560 TTT_EVAL_SEQ_LEN=2560 \
 TTT_MASK=no_qv TTT_Q_LORA=0 TTT_V_LORA=0 TTT_LOCAL_LR_MULT=0.75 \
 TTT_LORA_RANK=80 TTT_WEIGHT_DECAY=0.5 TTT_BETA2=0.99 \
 TTT_SCALE_ADAPTER_ENABLED=1 TTT_SCALE_ADAPTER_LIMIT="$TTT_SCALE_ADAPTER_LIMIT" \
+TTT_DOC_BIAS_ENABLED="$TTT_DOC_BIAS_ENABLED" TTT_DOC_BIAS_CLIP="$TTT_DOC_BIAS_CLIP" TTT_DOC_BIAS_LR_MULT="$TTT_DOC_BIAS_LR_MULT" \
+TTT_EVAL_ONLY="$TTT_EVAL_ONLY" \
 QK_GAIN_INIT=5.25 \
 EMBED_BITS=7 MATRIX_LR=0.026 MIN_LR=0.1 \
 MATRIX_CLIP_SIGMAS=12.85 ATTN_CLIP_SIGMAS=13.0 MLP_CLIP_SIGMAS=11.5 EMBED_CLIP_SIGMAS=14.0 \

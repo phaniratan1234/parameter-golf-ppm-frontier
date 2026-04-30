@@ -323,6 +323,10 @@ class Hyperparameters:
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     ttt_scale_adapter_enabled = bool(int(os.environ.get("TTT_SCALE_ADAPTER_ENABLED", "0")))
     ttt_scale_adapter_limit = float(os.environ.get("TTT_SCALE_ADAPTER_LIMIT", 0.05))
+    ttt_doc_bias_enabled = bool(int(os.environ.get("TTT_DOC_BIAS_ENABLED", "0")))
+    ttt_doc_bias_clip = float(os.environ.get("TTT_DOC_BIAS_CLIP", 0.35))
+    ttt_doc_bias_lr_mult = float(os.environ.get("TTT_DOC_BIAS_LR_MULT", 16.0))
+    ttt_doc_bias_weight_decay = float(os.environ.get("TTT_DOC_BIAS_WEIGHT_DECAY", 0.02))
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
@@ -1553,6 +1557,8 @@ class GPT(nn.Module):
             logits = self._apply_asym_softcap(logits)
         else:
             logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        if lora.doc_bias is not None:
+            logits = logits + lora.doc_bias_logits(logits.dtype)
         bsz, sl, V = logits.shape
         return F.cross_entropy(
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
@@ -1735,10 +1741,12 @@ class BatchedTTTLoRA(nn.Module):
         self, bsz, model, rank,
         q_lora=True, k_lora=True, v_lora=True, mlp_lora=True, o_lora=True,
         scale_adapter=False, scale_limit=0.05,
+        doc_bias=False, doc_bias_clip=0.35,
     ):
         super().__init__()
         self.bsz = bsz
         self.scale_limit = float(scale_limit)
+        self.doc_bias_clip = float(doc_bias_clip)
         dim = model.qo_bank.shape[-1]
         vocab = model.tok_emb.num_embeddings
         if getattr(model, "looping_active", False):
@@ -1795,6 +1803,11 @@ class BatchedTTTLoRA(nn.Module):
             if scale_adapter
             else None
         )
+        self.doc_bias = (
+            nn.Parameter(torch.zeros(bsz, vocab))
+            if doc_bias
+            else None
+        )
 
     def attn_gain(self, slot, dtype):
         return 1.0 + self.scale_limit * torch.tanh(
@@ -1805,6 +1818,12 @@ class BatchedTTTLoRA(nn.Module):
         return 1.0 + self.scale_limit * torch.tanh(
             self.mlp_scale_delta[:, slot, :]
         ).to(dtype)[:, None, :]
+
+    def doc_bias_logits(self, dtype):
+        return self.doc_bias_clip * torch.tanh(self.doc_bias).to(dtype)[:, None, :]
+
+    def doc_bias_parameters(self):
+        return [] if self.doc_bias is None else [self.doc_bias]
 
     def reset(self):
         with torch.no_grad():
@@ -1818,6 +1837,8 @@ class BatchedTTTLoRA(nn.Module):
                 self.attn_scale_delta.zero_()
             if self.mlp_scale_delta is not None:
                 self.mlp_scale_delta.zero_()
+            if self.doc_bias is not None:
+                self.doc_bias.zero_()
 
 
 # Polar Express per-iteration minimax Newton-Schulz coefficients (PR #1344).
@@ -3407,19 +3428,45 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
         mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
         scale_adapter=h.ttt_scale_adapter_enabled,
         scale_limit=h.ttt_scale_adapter_limit,
+        doc_bias=h.ttt_doc_bias_enabled,
+        doc_bias_clip=h.ttt_doc_bias_clip,
     ).to(device)
 
     def _build_opt(lora):
         local_lr = h.ttt_lora_lr * h.ttt_local_lr_mult
+        doc_bias_params = list(lora.doc_bias_parameters())
+        if doc_bias_params:
+            doc_ids = {id(p) for p in doc_bias_params}
+            base_params = [p for p in lora.parameters() if id(p) not in doc_ids]
+            param_groups = [
+                {
+                    "params": base_params,
+                    "lr": local_lr,
+                    "weight_decay": h.ttt_weight_decay,
+                },
+                {
+                    "params": doc_bias_params,
+                    "lr": local_lr * h.ttt_doc_bias_lr_mult,
+                    "weight_decay": h.ttt_doc_bias_weight_decay,
+                },
+            ]
+        else:
+            param_groups = [
+                {
+                    "params": lora.parameters(),
+                    "lr": local_lr,
+                    "weight_decay": h.ttt_weight_decay,
+                }
+            ]
         if h.ttt_optimizer == "sgd":
             return torch.optim.SGD(
-                lora.parameters(), lr=local_lr,
-                momentum=h.ttt_beta1, weight_decay=h.ttt_weight_decay,
+                param_groups,
+                momentum=h.ttt_beta1,
             )
         return torch.optim.AdamW(
-            lora.parameters(), lr=local_lr,
+            param_groups,
             betas=(h.ttt_beta1, h.ttt_beta2),
-            eps=1e-10, weight_decay=h.ttt_weight_decay, fused=True,
+            eps=1e-10, fused=True,
         )
 
     reusable_opt = _build_opt(reusable_lora)
@@ -3453,6 +3500,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
                 scale_adapter=h.ttt_scale_adapter_enabled,
                 scale_limit=h.ttt_scale_adapter_limit,
+                doc_bias=h.ttt_doc_bias_enabled,
+                doc_bias_clip=h.ttt_doc_bias_clip,
             ).to(device)
             cur_opt = _build_opt(cur_lora)
         pred_lens = [doc_len - 1 for _, doc_len in batch]
@@ -3627,6 +3676,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                     mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
                     scale_adapter=h.ttt_scale_adapter_enabled,
                     scale_limit=h.ttt_scale_adapter_limit,
+                    doc_bias=h.ttt_doc_bias_enabled,
+                    doc_bias_clip=h.ttt_doc_bias_clip,
                 ).to(device)
                 reusable_opt = _build_opt(reusable_lora)
                 current_phase += 1
@@ -4014,6 +4065,8 @@ def train_and_eval(h, device):
                 mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
                 scale_adapter=h.ttt_scale_adapter_enabled,
                 scale_limit=h.ttt_scale_adapter_limit,
+                doc_bias=h.ttt_doc_bias_enabled,
+                doc_bias_clip=h.ttt_doc_bias_clip,
             ).to(device)
             wo = torch.optim.AdamW(
                 wl.parameters(),
