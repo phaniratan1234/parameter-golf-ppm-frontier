@@ -321,6 +321,8 @@ class Hyperparameters:
     ttt_o_lora = bool(int(os.environ.get("TTT_O_LORA", "1")))
     ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "adam")
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
+    ttt_scale_adapter_enabled = bool(int(os.environ.get("TTT_SCALE_ADAPTER_ENABLED", "0")))
+    ttt_scale_adapter_limit = float(os.environ.get("TTT_SCALE_ADAPTER_LIMIT", 0.05))
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
@@ -1610,12 +1612,18 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        attn_scale = block.attn_scale.to(dtype=x_in.dtype)[None, None, :]
+        if lora.attn_scale_delta is not None:
+            attn_scale = attn_scale * lora.attn_gain(slot, x_in.dtype)
+        x_out = x_in + attn_scale * attn_out
         mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+        mlp_scale = block.mlp_scale.to(dtype=x_out.dtype)[None, None, :]
+        if lora.mlp_scale_delta is not None:
+            mlp_scale = mlp_scale * lora.mlp_gain(slot, x_out.dtype)
+        x_out = x_out + mlp_scale * mlp_out
         return x_out
 
     def _parallel_block_with_lora(
@@ -1673,13 +1681,19 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
+        attn_scale = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :]
+        if lora.attn_scale_delta is not None:
+            attn_scale = attn_scale * lora.attn_gain(slot, attn_out.dtype)
+        attn_out = attn_scale * attn_out
         mlp_read = lane1
         mlp_n = block.mlp_norm(mlp_read) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
+        mlp_scale = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :]
+        if lora.mlp_scale_delta is not None:
+            mlp_scale = mlp_scale * lora.mlp_gain(slot, lane1.dtype)
+        mlp_out = mlp_scale * mlp_out
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
@@ -1720,9 +1734,11 @@ class BatchedTTTLoRA(nn.Module):
     def __init__(
         self, bsz, model, rank,
         q_lora=True, k_lora=True, v_lora=True, mlp_lora=True, o_lora=True,
+        scale_adapter=False, scale_limit=0.05,
     ):
         super().__init__()
         self.bsz = bsz
+        self.scale_limit = float(scale_limit)
         dim = model.qo_bank.shape[-1]
         vocab = model.tok_emb.num_embeddings
         if getattr(model, "looping_active", False):
@@ -1769,6 +1785,26 @@ class BatchedTTTLoRA(nn.Module):
             if o_lora
             else None
         )
+        self.attn_scale_delta = (
+            nn.Parameter(torch.zeros(bsz, num_slots, dim))
+            if scale_adapter
+            else None
+        )
+        self.mlp_scale_delta = (
+            nn.Parameter(torch.zeros(bsz, num_slots, dim))
+            if scale_adapter
+            else None
+        )
+
+    def attn_gain(self, slot, dtype):
+        return 1.0 + self.scale_limit * torch.tanh(
+            self.attn_scale_delta[:, slot, :]
+        ).to(dtype)[:, None, :]
+
+    def mlp_gain(self, slot, dtype):
+        return 1.0 + self.scale_limit * torch.tanh(
+            self.mlp_scale_delta[:, slot, :]
+        ).to(dtype)[:, None, :]
 
     def reset(self):
         with torch.no_grad():
@@ -1778,6 +1814,10 @@ class BatchedTTTLoRA(nn.Module):
                 if loras is not None:
                     for lora in loras:
                         lora.reset()
+            if self.attn_scale_delta is not None:
+                self.attn_scale_delta.zero_()
+            if self.mlp_scale_delta is not None:
+                self.mlp_scale_delta.zero_()
 
 
 # Polar Express per-iteration minimax Newton-Schulz coefficients (PR #1344).
@@ -3365,6 +3405,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
         h.ttt_batch_size, base_model, h.ttt_lora_rank,
         q_lora=h.ttt_q_lora, k_lora=h.ttt_k_lora, v_lora=h.ttt_v_lora,
         mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+        scale_adapter=h.ttt_scale_adapter_enabled,
+        scale_limit=h.ttt_scale_adapter_limit,
     ).to(device)
 
     def _build_opt(lora):
@@ -3409,6 +3451,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 bsz, base_model, h.ttt_lora_rank,
                 q_lora=h.ttt_q_lora, k_lora=h.ttt_k_lora, v_lora=h.ttt_v_lora,
                 mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+                scale_adapter=h.ttt_scale_adapter_enabled,
+                scale_limit=h.ttt_scale_adapter_limit,
             ).to(device)
             cur_opt = _build_opt(cur_lora)
         pred_lens = [doc_len - 1 for _, doc_len in batch]
@@ -3581,6 +3625,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                     h.ttt_batch_size, base_model, h.ttt_lora_rank,
                     q_lora=h.ttt_q_lora, k_lora=h.ttt_k_lora, v_lora=h.ttt_v_lora,
                     mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+                    scale_adapter=h.ttt_scale_adapter_enabled,
+                    scale_limit=h.ttt_scale_adapter_limit,
                 ).to(device)
                 reusable_opt = _build_opt(reusable_lora)
                 current_phase += 1
@@ -3966,6 +4012,8 @@ def train_and_eval(h, device):
                 bsz, ttt_model, h.ttt_lora_rank,
                 q_lora=h.ttt_q_lora, k_lora=h.ttt_k_lora, v_lora=h.ttt_v_lora,
                 mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+                scale_adapter=h.ttt_scale_adapter_enabled,
+                scale_limit=h.ttt_scale_adapter_limit,
             ).to(device)
             wo = torch.optim.AdamW(
                 wl.parameters(),
